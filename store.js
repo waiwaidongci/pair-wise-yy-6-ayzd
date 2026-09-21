@@ -1,0 +1,107 @@
+// 记录存储模块：只负责台账文件的读写，不含任何判定规则。
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+export const dbPath = join(__dirname, "data", "calibration-bench.json");
+
+// 初始台账：墨锭、纸样（同批宣纸按批号绑定）、水样、试磨单。
+// P-2024-旧17 与 W-03 故意缺少克重/硬度，用于演示准入 409。
+export const seed = {
+  sticks: [
+    { code: "IS-001", smokeSource: "黄山松烟", glueRatio: "7.5%", ageYears: 8, storage: "恒湿柜B", createdAt: "2026-06-01T00:00:00.000Z" },
+    { code: "IS-002", smokeSource: "桐油烟", glueRatio: "8%", ageYears: 3, storage: "试样盒C", createdAt: "2026-06-01T00:00:00.000Z" }
+  ],
+  papers: [
+    { batch: "P-2026-051", name: "净皮四尺宣", grammage: 32.2 },
+    { batch: "P-2026-052", name: "棉料绵连", grammage: 28.5 },
+    { batch: "P-2024-旧17", name: "旧档棉连（克重缺登）", grammage: null }
+  ],
+  waters: [
+    { code: "W-01", source: "黄山泉水", hardness: 42 },
+    { code: "W-02", source: "市政自来水", hardness: 168 },
+    { code: "W-03", source: "梅雨水（硬度缺测）", hardness: null }
+  ],
+  tests: [
+    {
+      id: "T-2026-0612-01",
+      inkCode: "IS-001",
+      paperBatch: "P-2026-051",
+      paperName: "净皮四尺宣",
+      paperGrammage: 32.2,
+      waterId: "W-01",
+      waterSource: "黄山泉水",
+      waterHardness: 42,
+      temp: 20.4,
+      humidity: 49,
+      rawScore: 86,
+      correctedScore: 86,
+      inRange: true,
+      violations: [],
+      status: "已封存",
+      verdict: "合格",
+      retestOf: null,
+      supersedes: null,
+      successorId: null,
+      retestIds: [],
+      archives: [],
+      history: [
+        { at: "2026-06-12T09:00:00.000Z", note: "试磨提交：绑定纸样 P-2026-051、水样 W-01" },
+        { at: "2026-06-13T02:00:00.000Z", note: "封存，结论计入统计" }
+      ],
+      createdAt: "2026-06-12T09:00:00.000Z",
+      sealedAt: "2026-06-13T02:00:00.000Z"
+    },
+    {
+      id: "T-2026-0620-01",
+      inkCode: "IS-002",
+      paperBatch: "P-2026-052",
+      paperName: "棉料绵连",
+      paperGrammage: 28.5,
+      waterId: "W-02",
+      waterSource: "市政自来水",
+      waterHardness: 168,
+      temp: 21.2,
+      humidity: 51,
+      rawScore: 80,
+      correctedScore: 79,
+      inRange: true,
+      violations: [],
+      status: "未封存",
+      verdict: "重点观察",
+      retestOf: null,
+      supersedes: null,
+      successorId: null,
+      retestIds: [],
+      archives: [],
+      history: [
+        { at: "2026-06-20T03:50:00.000Z", note: "试磨提交：绑定纸样 P-2026-052、水样 W-02" }
+      ],
+      createdAt: "2026-06-20T03:50:00.000Z",
+      sealedAt: null
+    }
+  ]
+};
+
+export class Store {
+  constructor(path = dbPath) {
+    this.path = path;
+    this.db = null;
+  }
+
+  async load() {
+    if (!existsSync(this.path)) {
+      await mkdir(dirname(this.path), { recursive: true });
+      await writeFile(this.path, JSON.stringify(seed, null, 2));
+    }
+    this.db = JSON.parse(await readFile(this.path, "utf8"));
+    for (const key of ["sticks", "papers", "waters", "tests"]) this.db[key] ||= [];
+    return this.db;
+  }
+
+  async save() {
+    await writeFile(this.path, JSON.stringify(this.db, null, 2));
+  }
+}

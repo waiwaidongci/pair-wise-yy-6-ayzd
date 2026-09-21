@@ -1,58 +1,24 @@
+// 入口模块：HTTP 路由与页面编排。判定走 rules.js，存储走 store.js。
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { Store } from "./store.js";
+import {
+  RuleError, TEST_STATUSES,
+  admitPaper, admitWater, admitStick, admitTest,
+  sealTest, retest, adjustTest, overview
+} from "./rules.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "ink-stick-testing.json");
 const port = Number(process.env.PORT || 3037);
-const seed = {
-  "items": [
-    {
-      "code": "IS-001",
-      "smokeSource": "黄山松烟",
-      "glueRatio": "7.5%",
-      "ageYears": 8,
-      "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
-      ]
-    },
-    {
-      "code": "IS-002",
-      "smokeSource": "桐油烟",
-      "glueRatio": "8%",
-      "ageYears": 3,
-      "storage": "试样盒C",
-      "status": "待试磨",
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
+const store = new Store();
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new RuleError(400, "invalid_json", "请求体不是合法 JSON");
+  }
 }
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -62,153 +28,399 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const db = await store.load();
+    const p = url.pathname;
+
+    if (req.method === "GET" && p === "/") return html(res, page());
+
+    // 卡片与统计共用一份快照
+    if (req.method === "GET" && p === "/api/overview") return send(res, 200, overview(db));
+
+    if (req.method === "POST" && p === "/api/sticks") {
+      const stick = admitStick(db, await body(req));
+      await store.save();
+      return send(res, 201, { stick, overview: overview(db) });
+    }
+    if (req.method === "POST" && p === "/api/papers") {
+      const paper = admitPaper(db, await body(req));
+      await store.save();
+      return send(res, 201, { paper, overview: overview(db) });
+    }
+    if (req.method === "POST" && p === "/api/waters") {
+      const water = admitWater(db, await body(req));
+      await store.save();
+      return send(res, 201, { water, overview: overview(db) });
+    }
+
+    // 试磨准入：墨锭 + 同批宣纸 + 水样绑定
+    if (req.method === "POST" && p === "/api/tests") {
+      const { test, reused } = admitTest(db, await body(req));
+      // 重复提交沿用首次：不写入，自然也不 save
+      if (!reused) await store.save();
+      return send(res, reused ? 200 : 201, { test, reused, overview: overview(db) });
+    }
+
+    const actionMatch = p.match(/^\/api\/tests\/([^/]+)\/(seal|retest|adjust)$/);
+    if (actionMatch && req.method === "POST") {
+      const [, id, action] = actionMatch;
+      const input = await body(req);
+      let result;
+      if (action === "seal") result = { test: sealTest(db, id) };
+      if (action === "retest") result = retest(db, id, input);
+      if (action === "adjust") result = adjustTest(db, id, input);
+      await store.save();
+      return send(res, 200, { ...result, overview: overview(db) });
+    }
+
+    return send(res, 404, { error: "not_found" });
+  } catch (error) {
+    if (error instanceof RuleError) {
+      return send(res, error.status, { error: error.code, message: error.message });
+    }
+    return send(res, 500, { error: "internal_error", message: error.message });
   }
-  return stats;
-}
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
+});
+
+server.listen(port, () => console.log("纸样水样准入与温湿度校正台 listening on http://localhost:" + port));
+
 function page() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
+  <title>纸样水样准入与温湿度校正台</title>
   <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
+    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; --hold:#8a6d1d; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
+    h1 { margin:0; font-size:24px; } h2 { margin:0 0 10px; font-size:16px; } main { display:grid; grid-template-columns:400px 1fr; gap:22px; padding:22px 28px; }
+    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    label { display:block; margin:8px 0 4px; color:var(--muted); font-size:13px; } input,select { width:100%; border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; background:#fff; }
+    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:9px 12px; font-weight:700; cursor:pointer; }
+    button.secondary { background:#69736a; } button.warn { background:var(--warn); } button.hold { background:var(--hold); }
+    form button { margin-top:12px; width:100%; } .leftcol { display:grid; gap:14px; align-content:start; }
+    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:22px; }
+    .stat.small strong { font-size:16px; }
+    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:150px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; } .card { display:grid; gap:6px; }
+    .meta { color:var(--muted); font-size:12px; } .row { display:flex; gap:8px; } .row > * { flex:1; }
+    .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 9px; font-size:12px; margin-right:5px; }
+    .pill.未封存 { background:#eef2e8; } .pill.待复测 { background:#f7efdc; color:var(--hold); }
+    .pill.已封存 { background:#e4ede0; color:var(--accent); } .pill.失效留档 { background:#f2e2dd; color:var(--warn); }
+    .verdict { font-weight:700; } .warn { color:var(--warn); font-weight:700; } .hold { color:var(--hold); font-weight:700; }
+    .logs { border-top:1px solid var(--line); padding-top:6px; max-height:96px; overflow:auto; } .logs div { margin:2px 0; }
+    .ledger { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-bottom:14px; }
+    .ledger ul { margin:6px 0 0; padding-left:18px; } .ledger li { margin:3px 0; font-size:13px; }
+    .btns { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; } .btns button { width:auto; padding:7px 10px; font-size:12px; }
+    #toast { position:fixed; right:20px; bottom:20px; max-width:420px; display:grid; gap:8px; z-index:10; }
+    .toast { padding:10px 14px; border-radius:8px; background:#20241f; color:#fff; font-size:13px; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+    .toast.err { background:var(--warn); }
+    dialog { border:1px solid var(--line); border-radius:10px; padding:18px; width:min(420px,92vw); }
+    dialog::backdrop { background:rgba(20,24,19,.45); }
+    @media (max-width:960px){ main{grid-template-columns:1fr;} header{display:block;padding:16px;} main{padding:14px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
+  <header>
+    <div><h1>纸样水样准入与温湿度校正台</h1>
+    <div class="meta">试磨绑定同批宣纸与水样 · 评分按 20℃ / 50% 湿度线性校正 · 越界转待复测</div></div>
+    <button id="reload">刷新</button>
+  </header>
   <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
+    <div class="leftcol">
+      <form id="stickForm"><h2>墨锭建档</h2>
+        <label>墨锭编号</label><input name="code" required placeholder="IS-003">
+        <div class="row"><div><label>烟料来源</label><input name="smokeSource"></div>
+        <div><label>胶料比例</label><input name="glueRatio" placeholder="8%"></div></div>
+        <div class="row"><div><label>存放年限</label><input name="ageYears" type="number"></div>
+        <div><label>存放位置</label><input name="storage"></div></div>
+        <button>保存墨锭</button>
+      </form>
+
+      <form id="paperForm"><h2>纸样准入（同批宣纸按批号）</h2>
+        <div class="row"><div><label>批号</label><input name="batch" required placeholder="P-2026-053"></div>
+        <div><label>名称</label><input name="name" required placeholder="净皮六尺宣"></div></div>
+        <label>克重（g/㎡，缺失将被 409 拒绝）</label><input name="grammage" type="number" step="0.1" placeholder="如 32.2">
+        <button>登记纸样</button>
+      </form>
+
+      <form id="waterForm"><h2>水样准入</h2>
+        <div class="row"><div><label>水样编号</label><input name="code" required placeholder="W-04"></div>
+        <div><label>水源</label><input name="source" required placeholder="山泉水"></div></div>
+        <label>硬度（mg/L CaCO₃，缺失将被 409 拒绝）</label><input name="hardness" type="number" step="1" placeholder="如 42">
+        <button>登记水样</button>
+      </form>
+
+      <form id="testForm"><h2>创建试磨（绑定墨锭/纸样/水样）</h2>
+        <label>墨锭</label><select name="inkCode" id="inkSelect"></select>
+        <label>同批宣纸</label><select name="paperBatch" id="paperSelect"></select>
+        <label>水样</label><select name="waterId" id="waterSelect"></select>
+        <div class="row">
+          <div><label>实测温度 ℃（合格 18~22）</label><input name="temp" type="number" step="0.1" value="20"></div>
+          <div><label>实测湿度 %（合格 45~55）</label><input name="humidity" type="number" step="1" value="50"></div>
+        </div>
+        <label>原始评分（0~100，校正后 ≥85 为合格）</label><input name="rawScore" type="number" min="0" max="100" placeholder="如 86">
+        <button>提交试磨</button>
+      </form>
+    </div>
+
     <section>
       <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
+      <div class="ledger" id="ledger"></div>
+      <div class="toolbar">
+        <select id="statusFilter"><option value="">全部状态</option>${TEST_STATUSES.map(s => '<option>' + s + '</option>').join('')}</select>
+        <input id="search" placeholder="搜索单号 / 墨锭 / 纸样 / 水样">
+        <span class="meta" id="basis"></span>
+      </div>
+      <div class="panel"><h2>试磨单卡片</h2><div class="grid" id="cards"></div></div>
     </section>
   </main>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialogForm">
+      <h2 id="dlgTitle"></h2>
+      <div id="dlgBody"></div>
+      <div class="btns" style="margin-top:14px">
+        <button value="confirm" id="dlgOk">提交</button>
+        <button type="button" class="secondary" id="dlgCancel">取消</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast"></div>
+
   <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
+    const TEST_STATUSES = ${JSON.stringify(TEST_STATUSES)};
+    let state = { sticks: [], papers: [], waters: [], tests: [], stats: null };
+    const $ = sel => document.querySelector(sel);
+    const esc = v => String(v ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    const formJson = form => Object.fromEntries(new FormData(form).entries());
+
+    function toast(message, isErr) {
+      const el = document.createElement('div');
+      el.className = 'toast' + (isErr ? ' err' : '');
+      el.textContent = message;
+      $('#toast').appendChild(el);
+      setTimeout(() => el.remove(), 4200);
+    }
+
     async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
+      const res = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json' } });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
+      if (!res.ok) {
+        const err = new Error(data.message || data.error || '请求失败');
+        err.status = res.status;
+        throw err;
+      }
       return data;
     }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
+    function apply(data) {
+      if (data && data.overview) state = data.overview;
+      render();
     }
+
+    function syncSelects() {
+      const ink = $('#inkSelect'), paper = $('#paperSelect'), water = $('#waterSelect');
+      ink.innerHTML = state.sticks.map(s => '<option value="' + esc(s.code) + '">' + esc(s.code) + ' · ' + esc(s.smokeSource || '') + '</option>').join('');
+      paper.innerHTML = state.papers.map(p => '<option value="' + esc(p.batch) + '">' + esc(p.batch) + ' · ' + esc(p.name)
+        + (p.grammage == null ? '（缺克重·禁入）' : ' · ' + p.grammage + 'g/㎡') + '</option>').join('');
+      water.innerHTML = state.waters.map(w => '<option value="' + esc(w.code) + '">' + esc(w.code) + ' · ' + esc(w.source)
+        + (w.hardness == null ? '（缺硬度·禁入）' : ' · ' + w.hardness + 'mg/L') + '</option>').join('');
+    }
+
+    function renderStats() {
+      const s = state.stats;
+      const t = s.tests, sealed = s.sealed;
+      const cells = [
+        ['未封存', t['未封存']], ['待复测', t['待复测']], ['已封存', t['已封存']], ['失效留档(不计统计)', s.archivedCount]
+      ];
+      $('#stats').innerHTML = cells.map(([k, v]) => '<div class="stat"><span>' + k + '</span><strong>' + v + '</strong></div>').join('')
+        + '<div class="stat small"><span>封存合格 / 观察</span><strong>' + sealed.passCount + ' / ' + sealed.watchCount + '</strong></div>'
+        + '<div class="stat small"><span>封存校正均分</span><strong>' + (sealed.avgCorrectedScore ?? '—') + '</strong></div>'
+        + Object.entries(s.sticks).map(([k, v]) => '<div class="stat small"><span>墨锭·' + k + '</span><strong>' + v + '</strong></div>').join('');
+      $('#basis').textContent = s.countedBasis + '；合格线 ' + s.correction.passScore + ' 分';
+    }
+
+    function renderLedger() {
+      $('#ledger').innerHTML =
+        '<div class="panel"><h2>纸样台账（' + state.papers.length + '）</h2><ul>'
+        + state.papers.map(p => '<li>' + esc(p.batch) + ' ' + esc(p.name)
+          + (p.grammage == null ? ' <span class="warn">缺克重</span>' : ' · ' + p.grammage + 'g/㎡') + '</li>').join('')
+        + '</ul></div>'
+        + '<div class="panel"><h2>水样台账（' + state.waters.length + '）</h2><ul>'
+        + state.waters.map(w => '<li>' + esc(w.code) + ' ' + esc(w.source)
+          + (w.hardness == null ? ' <span class="warn">缺硬度</span>' : ' · ' + w.hardness + 'mg/L') + '</li>').join('')
+        + '</ul></div>'
+        + '<div class="panel"><h2>墨锭台账（' + state.sticks.length + '）</h2><ul>'
+        + state.sticks.map(s => '<li>' + esc(s.code) + ' ' + esc(s.smokeSource || '')
+          + ' · <span class="pill">' + esc(s.derivedStatus) + '</span></li>').join('')
+        + '</ul></div>';
+    }
+
+    function cardButtons(test) {
+      if (test.status === '已封存') {
+        return '<div class="btns"><button class="warn" data-adjust="' + esc(test.id) + '">调整纸/水样（原结论失效留档）</button></div>';
+      }
+      if (test.status === '待复测') {
+        return '<div class="btns"><button class="hold" data-retest="' + esc(test.id) + '">复测（须换纸样）</button>'
+          + '<button class="secondary" data-reeval="' + esc(test.id) + '">重录环境/评分</button></div>';
+      }
+      if (test.status === '未封存') {
+        return '<div class="btns"><button data-seal="' + esc(test.id) + '">封存</button>'
+          + '<button class="hold" data-retest="' + esc(test.id) + '">复测（须换纸样）</button>'
+          + '<button class="secondary" data-reeval="' + esc(test.id) + '">重录环境/评分</button>'
+          + '<button class="warn" data-adjust="' + esc(test.id) + '">调整纸/水样</button></div>';
+      }
+      return '<div class="meta">已失效留档，不计统计' + (test.successorId && test.successorId !== '(pending)'
+        ? '；承接单 ' + esc(test.successorId) : '') + '</div>';
+    }
+
+    function cardHtml(test) {
+      const logs = (test.history || []).slice(-4).map(l => '<div>' + esc(l.at.slice(0, 16).replace('T', ' ')) + ' ' + esc(l.note) + '</div>').join('');
+      const link = test.retestOf ? '<div class="meta">复测自 ' + esc(test.retestOf) + '</div>'
+        : test.supersedes ? '<div class="meta">承接自 ' + esc(test.supersedes) + '（原单已失效留档）</div>' : '';
+      return '<article class="card">'
+        + '<div><h3 style="margin:0;display:inline">' + esc(test.id) + '</h3></div>'
+        + '<div><span class="pill ' + esc(test.status) + '">' + esc(test.status) + '</span>'
+        + '<span class="verdict ' + (test.verdict === '合格' ? '' : 'hold') + '">'
+        + (test.verdict ? esc(test.verdict) : '暂无结论') + '</span></div>'
+        + '<div class="meta">墨锭 <b>' + esc(test.inkCode) + '</b></div>'
+        + '<div class="meta">纸样 ' + esc(test.paperBatch) + ' ' + esc(test.paperName) + ' · ' + test.paperGrammage + 'g/㎡</div>'
+        + '<div class="meta">水样 ' + esc(test.waterId) + ' ' + esc(test.waterSource) + ' · 硬度 ' + test.waterHardness + 'mg/L</div>'
+        + '<div>环境 ' + test.temp + '℃ / ' + test.humidity + '%'
+        + (test.inRange ? '' : ' <span class="warn">' + esc(test.violations.join('；')) + '</span>') + '</div>'
+        + '<div>原始分 <b>' + test.rawScore + '</b> → 校正分 <b>' + test.correctedScore + '</b></div>'
+        + link
+        + cardButtons(test)
+        + '<div class="logs meta">' + (logs || '暂无记录') + '</div>'
+        + '</article>';
+    }
+
+    function renderCards() {
+      const status = $('#statusFilter').value;
+      const q = $('#search').value.trim();
+      const visible = state.tests.filter(t =>
+        (!status || t.status === status)
+        && (!q || [t.id, t.inkCode, t.paperBatch, t.paperName, t.waterId, t.waterSource].join(' ').includes(q)));
+      // 新单在前，失效留档沉底
+      visible.sort((a, b) => (a.status === '失效留档') - (b.status === '失效留档') || b.createdAt.localeCompare(a.createdAt));
+      $('#cards').innerHTML = visible.map(cardHtml).join('') || '<div class="meta">暂无试磨单</div>';
+    }
+
     function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
+      syncSelects();
+      renderStats();
+      renderLedger();
+      renderCards();
     }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+
+    // ---- 复测 / 重录 / 调整 对话框 ----
+    const dlg = $('#dialog');
+    function openDialog(title, bodyHtml) {
+      $('#dlgTitle').textContent = title;
+      $('#dlgBody').innerHTML = bodyHtml;
+      dlg.showModal();
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
+    $('#dlgCancel').onclick = () => dlg.close();
+
+    function envScoreFields(test) {
+      return '<div class="row"><div><label>实测温度 ℃</label><input name="temp" type="number" step="0.1" value="' + (test?.temp ?? 20) + '"></div>'
+        + '<div><label>实测湿度 %</label><input name="humidity" type="number" step="1" value="' + (test?.humidity ?? 50) + '"></div></div>'
+        + '<label>原始评分</label><input name="rawScore" type="number" min="0" max="100" value="' + (test?.rawScore ?? '') + '">';
+    }
+    function paperWaterFields(test) {
+      return '<label>新纸样（必须换一批）</label><select name="paperBatch">'
+        + state.papers.map(p => '<option value="' + esc(p.batch) + '"' + (p.batch === test?.paperBatch ? ' disabled' : '') + '>'
+          + esc(p.batch) + ' ' + esc(p.name) + (p.grammage == null ? '（缺克重）' : '') + '</option>').join('')
+        + '</select>'
+        + '<label>水样（可沿用）</label><select name="waterId">'
+        + state.waters.map(w => '<option value="' + esc(w.code) + '"' + (w.code === test?.waterId ? ' selected' : '') + '>'
+          + esc(w.code) + ' ' + esc(w.source) + (w.hardness == null ? '（缺硬度）' : '') + '</option>').join('')
+        + '</select>';
+    }
+
+    document.addEventListener('click', async event => {
+      const find = key => event.target.closest('[' + key + ']')?.getAttribute(key);
+      const sealId = find('data-seal'), retestId = find('data-retest'),
+        reevalId = find('data-reeval'), adjustId = find('data-adjust');
+      try {
+        if (sealId) {
+          apply(await api('/api/tests/' + encodeURIComponent(sealId) + '/seal', { method: 'POST', body: '{}' }));
+          toast('已封存，结论计入统计');
+        } else if (reevalId) {
+          const test = state.tests.find(t => t.id === reevalId);
+          openDialog('重录环境 / 评分（不换纸样水样）', envScoreFields(test));
+          $('#dlgOk').onclick = async () => {
+            apply(await api('/api/tests/' + encodeURIComponent(reevalId) + '/adjust',
+              { method: 'POST', body: JSON.stringify(formJson($('#dialogForm'))) }));
+            dlg.close();
+            toast('已按新环境重算校正分与结论');
+          };
+        } else if (retestId) {
+          const test = state.tests.find(t => t.id === retestId);
+          openDialog('复测：须更换纸样', paperWaterFields(test) + envScoreFields(test));
+          $('#dlgOk').onclick = async () => {
+            apply(await api('/api/tests/' + encodeURIComponent(retestId) + '/retest',
+              { method: 'POST', body: JSON.stringify(formJson($('#dialogForm'))) }));
+            dlg.close();
+            toast('已按新纸样发起复测');
+          };
+        } else if (adjustId) {
+          const test = state.tests.find(t => t.id === adjustId);
+          openDialog('调整纸样 / 水样：原结论将失效留档且不计统计', paperWaterFields(test) + envScoreFields(test));
+          $('#dlgOk').onclick = async () => {
+            apply(await api('/api/tests/' + encodeURIComponent(adjustId) + '/adjust',
+              { method: 'POST', body: JSON.stringify(formJson($('#dialogForm'))) }));
+            dlg.close();
+            toast('原结论已失效留档，新单已建立');
+          };
+        }
+      } catch (err) {
+        dlg.close();
+        const prefix = err.status === 409 ? '准入冲突 409：' : '操作失败：';
+        toast(prefix + err.message, true);
+      }
+    });
+
+    async function submitForm(form, path, success, reset) {
+      try {
+        const data = await api(path, { method: 'POST', body: JSON.stringify(formJson(form)) });
+        apply(data);
+        if (reset) form.reset();
+        toast(success(data));
+      } catch (err) {
+        const prefix = err.status === 409 ? '准入冲突 409：' : err.status === 400 ? '提交有误：' : '操作失败：';
+        toast(prefix + err.message, true);
+      }
+    }
+    $('#stickForm').onsubmit = e => { e.preventDefault(); submitForm(e.target, '/api/sticks', () => '墨锭已建档', true); };
+    $('#paperForm').onsubmit = e => { e.preventDefault(); submitForm(e.target, '/api/papers', () => '纸样准入成功', true); };
+    $('#waterForm').onsubmit = e => { e.preventDefault(); submitForm(e.target, '/api/waters', () => '水样准入成功', true); };
+    $('#testForm').onsubmit = e => {
+      e.preventDefault();
+      submitForm(e.target, '/api/tests', data => data.reused
+        ? '该纸样已有未封存试磨，已沿用首次提交：' + data.test.id
+        : '试磨已准入：' + data.test.id + (data.test.status === '待复测' ? '（温湿度越界，转待复测）' : ''), true);
+    };
+
+    $('#statusFilter').onchange = renderCards;
+    $('#search').oninput = renderCards;
+    $('#reload').onclick = load;
+
+    async function load() {
+      try {
+        state = await api('/api/overview');
+        render();
+      } catch (err) {
+        toast('加载失败：' + err.message, true);
+      }
+    }
+    load();
   </script>
 </body>
 </html>`;
 }
-
-const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
-      const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
-    }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
-    }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
-    }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
-    }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
-    send(res, 404, { error: "not_found" });
-  } catch (error) {
-    send(res, 500, { error: error.message });
-  }
-});
-server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
